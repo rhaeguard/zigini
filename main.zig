@@ -2,13 +2,32 @@ const std = @import("std");
 
 const AppErrors = error{ DelimiterNotFound, SyntaxError };
 
+pub const Section = struct {
+    const Self = @This();
+
+    name: []const u8,
+    entries: std.ArrayList(*Entry),
+
+    pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
+        var entries_size = self.entries.items.len;
+        while (entries_size > 0) : (entries_size -= 1) {
+            var entry = self.entries.items[entries_size - 1];
+            allocator.destroy(entry);
+        }
+        self.entries.deinit();
+    }
+};
+
+pub const Entry = struct { key: []const u8, value: []const u8 };
+
 pub const IniFile = struct {
     const Self = @This();
 
     sections: std.ArrayList(*Section),
     allocator: std.mem.Allocator,
+    lines: std.ArrayList([]u8),
 
-    pub fn parse(filename: []const u8, alloc: std.mem.Allocator) anyerror!*IniFile {
+    pub fn parse(filename: []const u8, alloc: std.mem.Allocator) anyerror!IniFile {
         var file = try std.fs.cwd().openFile(filename, .{});
         defer file.close();
 
@@ -16,13 +35,17 @@ pub const IniFile = struct {
         var in_stream = buf_reader.reader();
 
         var current_section: *Section = undefined;
-        var inifile: *IniFile = try alloc.create(IniFile);
-        inifile.* = .{ .sections = std.ArrayList(*Section).init(alloc), .allocator = alloc };
+        var inifile: IniFile = .{ .sections = std.ArrayList(*Section).init(alloc), .allocator = alloc, .lines = std.ArrayList([]u8).init(alloc) };
 
         var buf: [1024]u8 = undefined;
         while (try in_stream.readUntilDelimiterOrEof(&buf, '\n')) |original| {
-            var line = try alloc.alloc(u8, original.len); // TODO: leak!!!
+            var line = try alloc.alloc(u8, original.len);
             std.mem.copy(u8, line, original);
+            try inifile.lines.append(line);
+
+            if (is_empty_line(line)) {
+                continue;
+            }
 
             var first_char = line[0];
             if (first_char == ';') { // skip, it's a comment
@@ -34,19 +57,15 @@ pub const IniFile = struct {
                 current_section = try alloc.create(Section);
                 current_section.* = .{ .name = current_section_name, .entries = std.ArrayList(*Entry).init(alloc) };
                 try inifile.sections.append(current_section);
+                continue;
             }
 
-            var maybe_pos = find_equal_sign_pos(line);
-            if (maybe_pos != null) {
-                var pos = maybe_pos.?;
-
-                var key = trim_whitespaces(line[0..pos]);
-                var value = trim_whitespaces(line[pos + 1 .. line.len]);
-                var entry: *Entry = try alloc.create(Entry);
-                entry.*.key = key;
-                entry.*.value = value;
-                try current_section.entries.append(entry);
-            }
+            var pos = try find_equal_sign_pos(line);
+            var key = trim_whitespaces(line[0..pos]);
+            var value = trim_whitespaces(line[pos + 1 .. line.len]);
+            var entry: *Entry = try alloc.create(Entry);
+            entry.* = .{ .key = key, .value = value };
+            try current_section.entries.append(entry);
         }
 
         return inifile;
@@ -56,26 +75,30 @@ pub const IniFile = struct {
         var size: usize = self.sections.items.len;
         while (size > 0) : (size -= 1) {
             var section: *Section = self.sections.items[size - 1];
-            var entries_size = (section.*).entries.items.len;
-            while (entries_size > 0) : (entries_size -= 1) {
-                var entry = (section.*).entries.items[entries_size - 1];
-                self.allocator.destroy(entry);
-            }
-            (section.*).entries.deinit();
+            section.deinit(self.allocator);
+            self.allocator.destroy(section);
         }
         self.sections.deinit();
+
+        size = self.lines.items.len;
+        while (size > 0) : (size -= 1) {
+            var line = self.lines.items[size - 1];
+            self.allocator.free(line);
+        }
+
+        self.lines.deinit();
     }
 
     pub fn get(self: Self, section_name: []const u8, key: []const u8) ?[]const u8 {
         var size = self.sections.items.len;
         while (size > 0) : (size -= 1) {
             var section: *Section = self.sections.items[size - 1];
-            if (std.mem.eql(u8, section.*.name, section_name)) {
-                var entries_size = section.*.entries.items.len;
+            if (std.mem.eql(u8, section.name, section_name)) {
+                var entries_size = section.entries.items.len;
                 while (entries_size > 0) : (entries_size -= 1) {
-                    var entry: *Entry = section.*.entries.items[entries_size - 1];
-                    if (std.mem.eql(u8, key, entry.*.key)) {
-                        return entry.*.value;
+                    var entry: *Entry = section.entries.items[entries_size - 1];
+                    if (std.mem.eql(u8, key, entry.key)) {
+                        return entry.value;
                     }
                 }
             }
@@ -83,7 +106,17 @@ pub const IniFile = struct {
         return null;
     }
 
-    fn find_equal_sign_pos(slice: []u8) ?usize {
+    fn is_empty_line(line: []const u8) bool {
+        var size = line.len;
+        while (size > 0) : (size -= 1) {
+            if (!is_whitespace(line[size - 1])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn find_equal_sign_pos(slice: []u8) AppErrors!usize {
         var i: usize = 0;
         while (i < slice.len) : (i += 1) {
             if (slice[i] == '=') {
@@ -91,7 +124,7 @@ pub const IniFile = struct {
             }
         }
 
-        return null;
+        return AppErrors.DelimiterNotFound;
     }
 
     fn read_section_name(input: []u8) AppErrors![]const u8 {
@@ -127,10 +160,6 @@ pub const IniFile = struct {
     }
 };
 
-pub const Section = struct { name: []const u8, entries: std.ArrayList(*Entry) };
-
-pub const Entry = struct { key: []const u8, value: []const u8 };
-
 pub fn main() anyerror!void {
     var inifile = try IniFile.parse("./examples/example_1.ini", std.heap.page_allocator);
     defer inifile.deinit();
@@ -140,12 +169,16 @@ pub fn main() anyerror!void {
     std.log.info("result : {s}", .{result.?});
 }
 
+fn test_equals(inifile: IniFile, expected: []const u8, section_name: []const u8, key: []const u8) void {
+    std.debug.assert(std.mem.eql(u8, expected, (inifile.get(section_name, key)).?));
+}
+
 test "given ini file should parse correctly" {
     var inifile = try IniFile.parse("./examples/example_1.ini", std.testing.allocator);
     defer inifile.deinit();
-    std.debug.assert(std.mem.eql(u8, "John Doe", (inifile.get("owner", "name")).?));
-    std.debug.assert(std.mem.eql(u8, "Acme Widgets Inc.", (inifile.get("owner", "organization")).?));
-    std.debug.assert(std.mem.eql(u8, "192.0.2.62", (inifile.get("database", "server")).?));
-    std.debug.assert(std.mem.eql(u8, "143", (inifile.get("database", "port")).?));
-    std.debug.assert(std.mem.eql(u8, "\"payroll.dat\"", (inifile.get("database", "file")).?));
+    test_equals(inifile, "John Doe", "owner", "name");
+    test_equals(inifile, "Acme Widgets Inc.", "owner", "organization");
+    test_equals(inifile, "192.0.2.62", "database", "server");
+    test_equals(inifile, "143", "database", "port");
+    test_equals(inifile, "\"payroll.dat\"", "database", "file");
 }
